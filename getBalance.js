@@ -68,8 +68,8 @@ axios
     console.table(formatGoals);
     console.table({
       sumNav: formatNumber(sumNav),
-      sumProfit: formatNumber(sumProfit),
       sumDeposited: formatNumber(sumDeposited),
+      sumProfit: formatNumber(sumProfit),
       profit_ratio: ((sumProfit / sumDeposited) * 100).toFixed(2) + " %",
     });
 
