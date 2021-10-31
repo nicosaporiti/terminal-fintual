@@ -12,7 +12,6 @@ axios
   })
   .then(async (res) => {
     const { data } = await res.data;
-    const factor = 1;
 
     function formatNumber(n) {
       return new Intl.NumberFormat("es-ES").format(n).split(",")[0];
@@ -23,9 +22,9 @@ axios
       return {
         goal: name,
         type: goal_type,
-        nav: nav / factor,
-        profit: profit / factor,
-        deposited: deposited / factor,
+        nav: nav,
+        profit: profit,
+        deposited: deposited,
         profit_ratio: ((profit / deposited) * 100).toFixed(2) + " %",
       };
     });
@@ -52,26 +51,42 @@ axios
       sumDeposited += goals[i].deposited;
     }
 
-    console.log("\x1b[35m",`                                       
-                                                                                                             
-    _|_|_|_|  _|              _|                          _|                                          
-    _|            _|_|_|    _|_|_|_|  _|    _|    _|_|_|  _|        _|_|_|    _|_|    _|_|_|  _|_|    
-    _|_|_|    _|  _|    _|    _|      _|    _|  _|    _|  _|      _|        _|    _|  _|    _|    _|  
-    _|        _|  _|    _|    _|      _|    _|  _|    _|  _|      _|        _|    _|  _|    _|    _|  
-    _|        _|  _|    _|      _|_|    _|_|_|    _|_|_|  _|  _|    _|_|_|    _|_|    _|    _|    _|  
-                                                                                                      
-    `, "\x1b[35m")
-    console.log("\x1b[32m ____________________________________________________________________________________________________\x1b[32m", "\x1b[0m");
-    console.log(" ");
-    console.log("\x1b[32m Bienvenido \x1b[32m " + user + "\x1b[32m !!! Este es tu balance en FINTUAL a la fecha  \x1b[32m ", "\x1b[0m")
-    console.log("\x1b[32m ____________________________________________________________________________________________________\x1b[32m", "\x1b[0m");
-    console.table(formatGoals);
-    console.table({
+    let balance = {
       sumNav: formatNumber(sumNav),
       sumDeposited: formatNumber(sumDeposited),
       sumProfit: formatNumber(sumProfit),
       profit_ratio: ((sumProfit / sumDeposited) * 100).toFixed(2) + " %",
-    });
+    };
 
+    const logo =
+      "\x1b[35m" +
+      `                                       
+                                                                                                             
+       _|_|_|_|  _|              _|                          _|                                          
+       _|            _|_|_|    _|_|_|_|  _|    _|    _|_|_|  _|        _|_|_|    _|_|    _|_|_|  _|_|    
+       _|_|_|    _|  _|    _|    _|      _|    _|  _|    _|  _|      _|        _|    _|  _|    _|    _|  
+       _|        _|  _|    _|    _|      _|    _|  _|    _|  _|      _|        _|    _|  _|    _|    _|  
+       _|        _|  _|    _|      _|_|    _|_|_|    _|_|_|  _|  _|    _|_|_|    _|_|    _|    _|    _|  
+                                                                                                      
+    ` +
+      "\x1b[35m";
+
+    const userMenu =
+      "\x1b[32m‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\x1b[32m" +
+      "\x1b[0m" +
+      `
+    ` +
+      "\x1b[32m Bienvenido \x1b[32m " +
+      user +
+      "\x1b[32m !!! Este es tu balance en FINTUAL a la fecha  \x1b[32m " +
+      "\x1b[0m" +
+      `
+    ` +
+      "\x1b[32m ____________________________________________________________________________________________________\x1b[32m" +
+      "\x1b[0m";
+
+    console.log(logo, userMenu);
+    console.table(formatGoals);
+    console.table(balance);
   })
-  .catch(error => console.log(error.message));
+  .catch((error) => console.log(error.message));
