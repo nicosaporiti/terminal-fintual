@@ -8,7 +8,7 @@ const email = process.env.USER_EMAIL;
 const token = process.env.USER_TOKEN;
 const password = process.env.USER_PASSWORD;
 const COOKIE_FILE = path.join(__dirname, ".cookie");
-const POCHA_GOAL_NAMES = new Set(["Pocha M", "Pocha C"]);
+const GOAL_GROUPS_FILE = path.join(__dirname, ".goal-groups.json");
 const ANSI = {
   reset: "\x1b[0m",
   dim: "\x1b[2m",
@@ -18,6 +18,50 @@ const ANSI = {
   red: "\x1b[31m",
   yellow: "\x1b[33m",
 };
+
+function normalizeGoalGroups(source) {
+  if (!source) return [];
+
+  try {
+    const parsed = typeof source === "string" ? JSON.parse(source) : source;
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("GOAL_GROUPS debe ser un objeto JSON");
+    }
+
+    return Object.entries(parsed).flatMap(([label, names]) => {
+      if (!Array.isArray(names)) {
+        throw new Error(`GOAL_GROUPS.${label} debe ser un arreglo`);
+      }
+
+      const normalizedNames = names.filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim());
+      if (!normalizedNames.length) return [];
+
+      return [{ label, names: new Set(normalizedNames) }];
+    });
+  } catch (error) {
+    console.warn(`${ANSI.yellow}Aviso:${ANSI.reset} configuración de grupos inválida. Se omitirán grupos personalizados.`);
+    return [];
+  }
+}
+
+function loadGoalGroups() {
+  if (process.env.GOAL_GROUPS) {
+    return normalizeGoalGroups(process.env.GOAL_GROUPS);
+  }
+
+  try {
+    const fileContents = fs.readFileSync(GOAL_GROUPS_FILE, "utf-8");
+    return normalizeGoalGroups(JSON.parse(fileContents));
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn(`${ANSI.yellow}Aviso:${ANSI.reset} no se pudo leer ${path.basename(GOAL_GROUPS_FILE)}.`);
+    }
+    return [];
+  }
+}
+
+const customGoalGroups = loadGoalGroups();
 
 function askCode() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -88,6 +132,24 @@ function buildSubtotal(goals, label, predicate) {
     ...totals,
     profitRatioRaw: totals.sumDeposited ? (totals.sumProfit / totals.sumDeposited) * 100 : NaN,
   };
+}
+
+function buildSubtotals(goals) {
+  const subtotals = [];
+
+  const apvSubtotal = buildSubtotal(goals, "APV", (goal) => goal.type === "apv");
+  if (apvSubtotal.count > 0) {
+    subtotals.push(apvSubtotal);
+  }
+
+  for (const group of customGoalGroups) {
+    const subtotal = buildSubtotal(goals, group.label, (goal) => group.names.has(goal.goal));
+    if (subtotal.count > 0) {
+      subtotals.push(subtotal);
+    }
+  }
+
+  return subtotals;
 }
 
 function renderSubtotal(subtotal) {
@@ -259,8 +321,7 @@ async function main() {
     sumProfit,
     profitRatioRaw: sumDeposited ? (sumProfit / sumDeposited) * 100 : NaN,
   };
-  const apvSubtotal = buildSubtotal(goals, "APV", (goal) => goal.type === "apv");
-  const pochaSubtotal = buildSubtotal(goals, "POCHA", (goal) => POCHA_GOAL_NAMES.has(goal.goal));
+  const subtotals = buildSubtotals(goals);
 
   const title = `${ANSI.cyan}FINTUAL${ANSI.reset} ${ANSI.dim}TERMINAL${ANSI.reset}`;
   const subtitle = `${ANSI.dim}${email}${ANSI.reset}`;
@@ -271,9 +332,12 @@ async function main() {
   console.log(`${subtitle}  ${ANSI.dim}|${ANSI.reset}  ${updatedAt}`);
   console.log(renderRule());
   console.log(renderSummary(balance));
-  console.log(renderRule());
-  console.log(renderSubtotal(apvSubtotal));
-  console.log(renderSubtotal(pochaSubtotal));
+  if (subtotals.length > 0) {
+    console.log(renderRule());
+    for (const subtotal of subtotals) {
+      console.log(renderSubtotal(subtotal));
+    }
+  }
   console.log(renderRule());
   console.log(renderGoals(goals));
   console.log(renderRule());
