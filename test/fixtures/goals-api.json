@@ -1,0 +1,52 @@
+[
+  {
+    "id": "15937",
+    "attributes": {
+      "name": "Mi APV 👴 APV-B",
+      "goal_type": "apv",
+      "nav": 1000000,
+      "profit": 200000,
+      "deposited": 800000
+    }
+  },
+  {
+    "id": "488130",
+    "attributes": {
+      "name": "Jubilación APV-A",
+      "goal_type": "apv",
+      "nav": 500000,
+      "profit": 50000,
+      "deposited": 450000
+    }
+  },
+  {
+    "id": "27175",
+    "attributes": {
+      "name": "No Fear",
+      "goal_type": "other",
+      "nav": 300000,
+      "profit": 100000,
+      "deposited": 200000
+    }
+  },
+  {
+    "id": "999001",
+    "attributes": {
+      "name": "💰 Sabatini M",
+      "goal_type": "other",
+      "nav": 200000,
+      "profit": 10000,
+      "deposited": 190000
+    }
+  },
+  {
+    "id": "26431",
+    "attributes": {
+      "name": "Caja",
+      "goal_type": "other",
+      "nav": 100000,
+      "profit": -5000,
+      "deposited": 105000
+    }
+  }
+]

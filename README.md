@@ -2,222 +2,187 @@
 
 CLI minimalista para consultar el balance actual de tus objetivos en Fintual desde el terminal.
 
-Hoy el proyecto se enfoca en una sola tarea: autenticarse, leer `GET /api/goals` y mostrar una vista compacta estilo terminal financiera con totales, subtotales opcionales y detalle por objetivo.
+Autentica, lee `GET /api/goals`, muestra totales/subtotales/tabla, guarda snapshots locales (Δ1D/Δ1M) y puede exportar JSON o CSV.
 
 ## Estado actual
 
-Estado del proyecto al 28 de marzo de 2026:
+**v1.3** (8 de julio de 2026):
 
-- Funciona como CLI de consulta de balance actual.
-- Soporta autenticación no interactiva con `USER_EMAIL` + `USER_TOKEN`.
-- Soporta autenticación interactiva con `USER_EMAIL` + `USER_PASSWORD` + código enviado por email.
-- Guarda una cookie local para reutilizar la sesión web cuando aplica.
-- Muestra un resumen total, subtotal automático de `APV` y subtotales personalizados configurables por usuario.
-- No calcula rentabilidad mes a mes.
-- No guarda historial.
-- No tiene tests automatizados.
-- No tiene pipeline de CI ni empaquetado formal.
-
-## Qué muestra
-
-La salida actual incluye:
-
-- Encabezado compacto con email y hora de ejecución.
-- Resumen total:
-  `NAV`, `APORTE`, `P/L`, `RET`.
-- Subtotal automático para objetivos con `goal_type === "apv"`.
-- Subtotales opcionales definidos localmente por el usuario.
-- Tabla de objetivos con:
-  `GOAL`, `TYPE`, `NAV`, `APORTE`, `P/L`, `RET`.
-
-Los valores positivos se muestran en verde y los negativos en rojo.
-
-## Qué no hace
-
-Este proyecto no:
-
-- reconstruye rentabilidad histórica;
-- calcula ganancia/pérdida por mes;
-- descarga movimientos;
-- exporta CSV o JSON;
-- modifica objetivos ni realiza operaciones en Fintual.
-
-## Requisitos
-
-- Node.js
-- npm
-- una cuenta de Fintual
-- credenciales válidas para uno de los modos de autenticación descritos abajo
-
-## Instalación
-
-```bash
-npm install
-```
+- Balance actual con totales, subtotales, `%` de peso y `Δ1D` por objetivo.
+- Auth con `USER_TOKEN` (recomendado) o login web + cookie.
+- Flags: `--json`, `--csv`, `--sort`, `--type`, `--group`, `--grouped`, `--history`, `--no-snapshot`, `--no-diff`, `--keep-snapshots`, `--no-color`, `--help`.
+- Snapshots diarios en `.snapshots/` con poda configurable.
+- Grupos por **nombre** y/o **id** de goal.
+- Vista `--grouped` (tabla por secciones de subtotal).
+- Tests unitarios con fixtures (`npm test`).
+- No opera en Fintual ni calcula TWR/MWR formal.
 
 ## Uso
 
 ```bash
+npm install
 npm start
+npm test
 ```
-
-También puedes ejecutarlo directamente:
 
 ```bash
-node -r dotenv getBalance.js
+npm start -- --sort weight
+npm start -- --type apv
+npm start -- --group POCHA
+npm start -- --grouped
+npm start -- --json
+npm start -- --csv > balance.csv
+npm start -- --history
+npm start -- --keep-snapshots 90
+node getBalance.js --help
 ```
 
-## Modos de autenticación
+Binario opcional:
 
-El CLI intenta autenticarse en este orden.
-
-### 1. Token API
-
-Si existen `USER_EMAIL` y `USER_TOKEN`, el script usa primero la ruta no interactiva contra `/api/goals`.
-
-Este es el modo recomendado si quieres ejecutar el CLI desde:
-
-- scripts;
-- cron;
-- Raycast;
-- atajos o aliases del shell.
-
-Ejemplo:
-
-```env
-USER_EMAIL="tu-email@ejemplo.com"
-USER_TOKEN="tu-token"
+```bash
+npm link
+fintual --help
 ```
 
-### 2. Sesión web con cookie
+## Opciones CLI
 
-Si no hay token, el CLI intenta reutilizar una cookie local guardada en `.cookie`.
+| Flag | Descripción |
+|------|-------------|
+| `--json` | Salida JSON |
+| `--csv` | Salida CSV (no combinar con `--json`) |
+| `--sort <campo>` | `nav` (default), `pl`, `ret`, `name`, `weight`, `d1` |
+| `--type <tipo>` | Filtrar por `goal_type` |
+| `--group <etiqueta>` | Filtrar por grupo personalizado |
+| `--grouped` | Tabla agrupada por subtotales (APV → grupos → Sin grupo) |
+| `--history` | Listar snapshots (sin API) |
+| `--no-snapshot` | No guardar snapshot |
+| `--no-diff` | Ocultar Δ1D / Δ1M |
+| `--keep-snapshots <n>` | Retención en días (default `400`, `0` = sin poda) |
+| `--no-color` | Sin ANSI |
+| `-h`, `--help` | Ayuda |
 
-Si la cookie está vencida o el servidor responde `401`, el script intenta renovar sesión.
+## Snapshots y deltas
 
-### 3. Login interactivo
+Cada run exitoso escribe (salvo `--no-snapshot`):
 
-Si existen `USER_EMAIL` y `USER_PASSWORD`, el script puede iniciar sesión vía flujo web:
-
-1. solicita el envío de un código;
-2. pide el código en terminal;
-3. obtiene una cookie nueva;
-4. la guarda en `.cookie`.
-
-Ejemplo:
-
-```env
-USER_EMAIL="tu-email@ejemplo.com"
-USER_PASSWORD="tu-password"
+```text
+.snapshots/YYYY-MM-DD.json
 ```
 
-### Qué pasa cuando vence la cookie
+| Delta | Baseline |
+|-------|----------|
+| **Δ1D** | Último snapshot con fecha &lt; hoy |
+| **Δ1M** | Snapshot más reciente con fecha ≤ hoy − 30 días |
 
-- Si usas `USER_TOKEN`, la cookie no es necesaria.
-- Si usas cookie y sigue vigente, se reutiliza.
-- Si la cookie está vencida o Fintual responde `401`, el CLI intenta reloguearse.
-- Si no hay `USER_PASSWORD`, la renovación interactiva no puede ocurrir y el comando falla.
+Poda: después de guardar, borra snapshots con fecha &lt; hoy − `keep-snapshots` días.
 
-## Configuración local
+```bash
+# CLI
+node getBalance.js --keep-snapshots 180
 
-El repositorio ignora por git:
+# o env
+SNAPSHOT_KEEP_DAYS=180
+```
+
+## Grupos personalizados
+
+Archivo local `.goal-groups.json` (ignorado por git) o env `GOAL_GROUPS`.
+
+### Por nombre (como siempre)
+
+```json
+{
+  "POCHA": ["💰 Sabatini M"],
+  "CAJA": ["Caja", "🏢 Departamento"]
+}
+```
+
+### Por id
+
+```json
+{
+  "RISKY": ["#27175", "id:1693010"],
+  "APV_EXTRA": [488130]
+}
+```
+
+### Mixto explícito
+
+```json
+{
+  "MIXTO": {
+    "names": ["Caja"],
+    "ids": ["26431"]
+  }
+}
+```
+
+Plantilla: [.goal-groups.example.json](.goal-groups.example.json).
+
+Los ids los puedes ver en la salida `--json` / `--csv` (columna `id`).
+
+## Export CSV
+
+```bash
+node getBalance.js --csv --no-snapshot > balance.csv
+```
+
+Columnas:
+
+`id,name,type,group,nav,deposited,profit,return_pct,weight_pct,delta1d_nav,delta1d_profit,delta1m_nav,delta1m_profit`
+
+## Autenticación
+
+Orden de intento:
+
+1. `USER_EMAIL` + `USER_TOKEN` (recomendado, no interactivo)
+2. Cookie local válida en `.cookie` — **no requiere** `USER_EMAIL`, token ni password
+3. Login interactivo con `USER_EMAIL` + `USER_PASSWORD` + código email (solo modo terminal)
+
+Con `--json` / `--csv` el login interactivo está deshabilitado: usa token o cookie vigente. Los mensajes de auth van a **stderr** para no contaminar el payload.
+
+## Configuración local (gitignored)
 
 - `.env`
 - `.cookie`
 - `.goal-groups.json`
+- `.snapshots/`
 
-Eso permite que cada usuario tenga su configuración privada sin exponerla en el repositorio público.
+## Estructura
 
-## Grupos personalizados
-
-Además del subtotal automático de `APV`, puedes definir subtotales personalizados para conjuntos de objetivos.
-
-Hay dos formas de hacerlo.
-
-### Opción 1. Variable de entorno `GOAL_GROUPS`
-
-```env
-GOAL_GROUPS={"FAMILIA":["Objetivo 1","Objetivo 2"],"LARGO_PLAZO":["Casa","Jubilacion"]}
+```text
+getBalance.js          CLI (I/O, red, render)
+lib/core.js            Lógica pura (testable)
+test/core.test.js      Tests
+test/fixtures/         Fixtures de API y grupos
+.goal-groups.example.json
 ```
 
-### Opción 2. Archivo local `.goal-groups.json`
+## Tests
 
-```json
-{
-  "FAMILIA": ["Objetivo 1", "Objetivo 2"],
-  "LARGO_PLAZO": ["Casa", "Jubilacion"]
-}
+```bash
+npm test
 ```
 
-El archivo `.goal-groups.json` es local e ignorado por git. En el repo existe una plantilla pública en [.goal-groups.example.json](/Users/nsaporiti/DevNS/terminal-fintual/.goal-groups.example.json).
+Usa `node:test` (Node 18+). Cubre parseo de args, grupos por id/nombre, map/filter/sort, deltas, CSV, prune y secciones agrupadas.
 
-Reglas actuales:
+## Limitaciones
 
-- Si existe `GOAL_GROUPS`, esa configuración tiene prioridad.
-- Si no existe, el script intenta leer `.goal-groups.json`.
-- Si ninguna configuración está presente, solo se muestra el subtotal automático de `APV`.
-- Si la configuración está mal formada, el script omite los grupos personalizados y muestra un aviso.
-
-## Estructura del proyecto
-
-- [getBalance.js](/Users/nsaporiti/DevNS/terminal-fintual/getBalance.js)
-  CLI principal. Autenticación, lectura de goals, cálculos y render en terminal.
-- [package.json](/Users/nsaporiti/DevNS/terminal-fintual/package.json)
-  Dependencias y scripts.
-- [.goal-groups.example.json](/Users/nsaporiti/DevNS/terminal-fintual/.goal-groups.example.json)
-  Ejemplo público de agrupación local.
-
-## Dependencias
-
-Dependencias actuales:
-
-- `axios`
-- `dotenv`
-- `console.table`
-
-Nota:
-`console.table` quedó como dependencia heredada, pero la salida actual ya no depende de esa librería.
-
-## Limitaciones conocidas
-
-- El proyecto depende de endpoints y comportamientos no versionados por este repositorio.
-- No hay validación formal de esquema para las respuestas de Fintual.
-- No hay manejo avanzado de rate limits ni retries.
-- Los subtotales personalizados dependen del nombre exacto de cada objetivo.
-- La rentabilidad mostrada es la entregada por Fintual en `profit` y `deposited`; el CLI no recalcula performance propia.
-- No hay soporte para snapshots históricos.
+- Endpoints Fintual no versionados por este repo.
+- Deltas = diferencia de snapshots, no performance formal.
+- Sin retries avanzados.
 
 ## Seguridad
 
-Recomendaciones mínimas:
+No subas `.env`, `.cookie`, `.goal-groups.json` ni `.snapshots/`. Prefiere token sobre password.
 
-- No subas `.env`, `.cookie` ni `.goal-groups.json` al repositorio.
-- Si usas `USER_PASSWORD`, mantenla solo en tu entorno local.
-- Prefiere `USER_TOKEN` para ejecuciones no interactivas.
-- Si sospechas que una credencial fue expuesta, rótala antes de volver a usar el CLI.
+## Roadmap
 
-## Desarrollo
+- **v1.1** — flags, limpieza, errores, warnings, binario
+- **v1.2** — snapshots, Δ1D/Δ1M, `%`, history
+- **v1.3** — CSV, tests, match por id, `--grouped`, poda de snapshots
 
-El proyecto hoy es pequeño y no tiene tooling adicional. El flujo básico es:
-
-```bash
-npm install
-npm start
-```
-
-No hay suite de tests actualmente.
-
-## Roadmap sugerido
-
-Posibles mejoras futuras:
-
-- snapshots diarios o mensuales;
-- cálculo de P/L por período;
-- exportación CSV/JSON;
-- filtros por tipo de objetivo;
-- agrupación visual de la tabla por subtotal;
-- migración a configuración tipada;
-- tests de formato y autenticación.
+Posibles siguientes pasos: Raycast, retención más fina (weekly/monthly rollup), CI.
 
 ## Licencia
 

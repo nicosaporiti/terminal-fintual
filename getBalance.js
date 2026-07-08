@@ -1,14 +1,19 @@
+#!/usr/bin/env node
 require("dotenv").config();
 const axios = require("axios");
 const readline = require("readline");
 const fs = require("fs");
 const path = require("path");
 
+const core = require("./lib/core");
+
 const email = process.env.USER_EMAIL;
 const token = process.env.USER_TOKEN;
 const password = process.env.USER_PASSWORD;
 const COOKIE_FILE = path.join(__dirname, ".cookie");
 const GOAL_GROUPS_FILE = path.join(__dirname, ".goal-groups.json");
+const SNAPSHOTS_DIR = path.join(__dirname, ".snapshots");
+
 const ANSI = {
   reset: "\x1b[0m",
   dim: "\x1b[2m",
@@ -19,185 +24,236 @@ const ANSI = {
   yellow: "\x1b[33m",
 };
 
-function normalizeGoalGroups(source) {
-  if (!source) return [];
+let useColor = process.stdout.isTTY !== false;
 
-  try {
-    const parsed = typeof source === "string" ? JSON.parse(source) : source;
+function paint(code, text) {
+  if (!useColor) return text;
+  return `${code}${text}${ANSI.reset}`;
+}
 
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("GOAL_GROUPS debe ser un objeto JSON");
-    }
+function colorizeProfit(value, text) {
+  if (value > 0) return paint(ANSI.green, text);
+  if (value < 0) return paint(ANSI.red, text);
+  return paint(ANSI.white, text);
+}
 
-    return Object.entries(parsed).flatMap(([label, names]) => {
-      if (!Array.isArray(names)) {
-        throw new Error(`GOAL_GROUPS.${label} debe ser un arreglo`);
-      }
-
-      const normalizedNames = names.filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim());
-      if (!normalizedNames.length) return [];
-
-      return [{ label, names: new Set(normalizedNames) }];
-    });
-  } catch (error) {
-    console.warn(`${ANSI.yellow}Aviso:${ANSI.reset} configuración de grupos inválida. Se omitirán grupos personalizados.`);
-    return [];
-  }
+function renderRule(width = 110) {
+  return paint(ANSI.dim, "─".repeat(width));
 }
 
 function loadGoalGroups() {
   if (process.env.GOAL_GROUPS) {
-    return normalizeGoalGroups(process.env.GOAL_GROUPS);
+    const { groups, error } = core.tryNormalizeGoalGroups(process.env.GOAL_GROUPS);
+    if (error) {
+      console.warn(paint(ANSI.yellow, "Aviso:") + " configuración de grupos inválida. Se omitirán grupos personalizados.");
+    }
+    return groups;
   }
 
   try {
     const fileContents = fs.readFileSync(GOAL_GROUPS_FILE, "utf-8");
-    return normalizeGoalGroups(JSON.parse(fileContents));
+    const { groups, error } = core.tryNormalizeGoalGroups(JSON.parse(fileContents));
+    if (error) {
+      console.warn(paint(ANSI.yellow, "Aviso:") + " configuración de grupos inválida. Se omitirán grupos personalizados.");
+    }
+    return groups;
   } catch (error) {
     if (error.code !== "ENOENT") {
-      console.warn(`${ANSI.yellow}Aviso:${ANSI.reset} no se pudo leer ${path.basename(GOAL_GROUPS_FILE)}.`);
+      console.warn(paint(ANSI.yellow, "Aviso:") + ` no se pudo leer ${path.basename(GOAL_GROUPS_FILE)}.`);
     }
     return [];
   }
 }
 
-const customGoalGroups = loadGoalGroups();
+function printHelp() {
+  console.log(`
+terminal-fintual — balance de objetivos Fintual
+
+Uso:
+  npm start -- [opciones]
+  node getBalance.js [opciones]
+  fintual [opciones]
+
+Opciones:
+  --json                 Salida en JSON
+  --csv                  Salida en CSV
+  --sort <campo>         nav | pl | ret | name | weight | d1  (default: nav)
+  --type <tipo>          Filtrar por goal_type (ej: apv)
+  --group <etiqueta>     Filtrar por grupo personalizado
+  --grouped              Tabla agrupada por subtotales
+  --history              Listar snapshots locales (sin API)
+  --no-snapshot          No guardar snapshot
+  --no-diff              Ocultar deltas Δ1D / Δ1M
+  --keep-snapshots <n>   Días de retención de snapshots (default: ${core.DEFAULT_SNAPSHOT_KEEP_DAYS}, 0 = sin poda)
+  --no-color             Desactivar colores ANSI
+  -h, --help             Mostrar esta ayuda
+
+Snapshots:
+  Cada run guarda .snapshots/YYYY-MM-DD.json (portfolio completo).
+  Δ1D vs último snapshot de un día anterior.
+  Δ1M vs snapshot más cercano a hace ~30 días.
+  Poda automática de snapshots más antiguos que --keep-snapshots.
+
+Grupos (.goal-groups.json):
+  Nombres: ["Objetivo 1"]
+  IDs:     ["#488130"] o ["id:488130"] o números
+  Mixto:   { "names": ["Casa"], "ids": ["123"] }
+
+Autenticación (en orden):
+  1. USER_EMAIL + USER_TOKEN
+  2. Cookie local válida en .cookie (no requiere USER_EMAIL)
+  3. Login interactivo con USER_EMAIL + USER_PASSWORD (solo terminal; no con --json/--csv)
+
+Variables de entorno:
+  USER_EMAIL, USER_TOKEN, USER_PASSWORD, GOAL_GROUPS
+  SNAPSHOT_KEEP_DAYS   (alternativa a --keep-snapshots)
+`.trim());
+}
+
+function resolveKeepSnapshots(options) {
+  if (options.keepSnapshots != null) {
+    return options.keepSnapshots;
+  }
+  if (process.env.SNAPSHOT_KEEP_DAYS != null && process.env.SNAPSHOT_KEEP_DAYS !== "") {
+    const n = Number(process.env.SNAPSHOT_KEEP_DAYS);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`SNAPSHOT_KEEP_DAYS inválido: "${process.env.SNAPSHOT_KEEP_DAYS}"`);
+    }
+    return n;
+  }
+  return core.DEFAULT_SNAPSHOT_KEEP_DAYS;
+}
+
+function authStatus(message) {
+  // Always stderr so --json / --csv stdout stays machine-readable.
+  console.error(message);
+}
+
+function validateCredentials() {
+  // Cookie-only: API call uses Cookie header; email is optional for display/snapshots.
+  if (loadCookie()) {
+    return;
+  }
+
+  if (token) {
+    if (!email) {
+      throw new Error(
+        "Falta USER_EMAIL. Es requerido junto con USER_TOKEN."
+      );
+    }
+    return;
+  }
+
+  if (password) {
+    if (!email) {
+      throw new Error(
+        "Falta USER_EMAIL. Es requerido junto con USER_PASSWORD para login interactivo."
+      );
+    }
+    return;
+  }
+
+  throw new Error(
+    "Faltan credenciales. Usa una cookie válida en .cookie, o define USER_EMAIL + USER_TOKEN (recomendado), o USER_EMAIL + USER_PASSWORD."
+  );
+}
 
 function askCode() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // Prompt on stderr so structured stdout (--json/--csv) is never polluted.
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   return new Promise((resolve) => {
-    rl.question("\x1b[33mIngresa el código enviado a tu email: \x1b[0m", (code) => {
+    rl.question(paint(ANSI.yellow, "Ingresa el código enviado a tu email: "), (code) => {
       rl.close();
       resolve(code.trim());
     });
   });
 }
 
-function formatNumber(n) {
-  return new Intl.NumberFormat("es-ES").format(n).split(",")[0];
+function ensureSnapshotsDir() {
+  fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true, mode: 0o700 });
 }
 
-function formatCurrency(n) {
-  const sign = n < 0 ? "-" : "";
-  return `${sign}$${formatNumber(Math.abs(n))}`;
+function snapshotPath(dateKey) {
+  return path.join(SNAPSHOTS_DIR, `${dateKey}.json`);
 }
 
-function formatPercent(value) {
-  if (!Number.isFinite(value)) return "n/a";
-  return `${value.toFixed(2)}%`;
+function saveSnapshot(snapshot) {
+  ensureSnapshotsDir();
+  const file = snapshotPath(snapshot.date);
+  fs.writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+  return file;
 }
 
-function pad(value, width, alignment = "left") {
-  const text = String(value);
-  if (text.length >= width) return text;
-  return alignment === "right" ? text.padStart(width, " ") : text.padEnd(width, " ");
+function loadSnapshotFile(filePath) {
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (!data || !data.date || !Array.isArray(data.goals)) return null;
+    return data;
+  } catch {
+    return null;
+  }
 }
 
-function colorizeProfit(value, text) {
-  if (value > 0) return `${ANSI.green}${text}${ANSI.reset}`;
-  if (value < 0) return `${ANSI.red}${text}${ANSI.reset}`;
-  return `${ANSI.white}${text}${ANSI.reset}`;
+function listSnapshotMeta() {
+  if (!fs.existsSync(SNAPSHOTS_DIR)) return [];
+
+  return fs
+    .readdirSync(SNAPSHOTS_DIR)
+    .filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name))
+    .map((name) => {
+      const date = name.replace(/\.json$/, "");
+      const snapshot = loadSnapshotFile(path.join(SNAPSHOTS_DIR, name));
+      if (!snapshot) return null;
+      if (email && snapshot.email && snapshot.email !== email) return null;
+      return {
+        date,
+        email: snapshot.email,
+        nav: snapshot.summary?.nav ?? null,
+        profit: snapshot.summary?.profit ?? null,
+        deposited: snapshot.summary?.deposited ?? null,
+        goalCount: snapshot.goals.length,
+        capturedAt: snapshot.capturedAt,
+        snapshot,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 }
 
-function renderRule(width = 95) {
-  return `${ANSI.dim}${"─".repeat(width)}${ANSI.reset}`;
-}
+function pruneSnapshots(todayKey, keepDays) {
+  if (!keepDays || keepDays <= 0) return [];
 
-function renderSummary(balance) {
-  const summary = [
-    `NAV ${ANSI.white}${formatCurrency(balance.sumNav)}${ANSI.reset}`,
-    `APORTE ${ANSI.white}${formatCurrency(balance.sumDeposited)}${ANSI.reset}`,
-    `P/L ${colorizeProfit(balance.sumProfit, formatCurrency(balance.sumProfit))}`,
-    `RET ${colorizeProfit(balance.profitRatioRaw, formatPercent(balance.profitRatioRaw))}`,
-  ];
-
-  return summary.join(` ${ANSI.dim}|${ANSI.reset} `);
-}
-
-function buildSubtotal(goals, label, predicate) {
-  const matchingGoals = goals.filter(predicate);
-  const totals = matchingGoals.reduce(
-    (acc, goal) => {
-      acc.sumNav += goal.navRaw;
-      acc.sumDeposited += goal.depositedRaw;
-      acc.sumProfit += goal.profitRaw;
-      return acc;
-    },
-    { sumNav: 0, sumDeposited: 0, sumProfit: 0 }
+  const metas = listSnapshotMeta();
+  const toDelete = core.datesToPrune(
+    metas.map((m) => m.date),
+    todayKey,
+    keepDays
   );
 
-  return {
-    label,
-    count: matchingGoals.length,
-    ...totals,
-    profitRatioRaw: totals.sumDeposited ? (totals.sumProfit / totals.sumDeposited) * 100 : NaN,
-  };
-}
-
-function buildSubtotals(goals) {
-  const subtotals = [];
-
-  const apvSubtotal = buildSubtotal(goals, "APV", (goal) => goal.type === "apv");
-  if (apvSubtotal.count > 0) {
-    subtotals.push(apvSubtotal);
-  }
-
-  for (const group of customGoalGroups) {
-    const subtotal = buildSubtotal(goals, group.label, (goal) => group.names.has(goal.goal));
-    if (subtotal.count > 0) {
-      subtotals.push(subtotal);
+  for (const date of toDelete) {
+    try {
+      fs.unlinkSync(snapshotPath(date));
+    } catch {
+      // ignore missing files
     }
   }
 
-  return subtotals;
+  return toDelete;
 }
 
-function renderSubtotal(subtotal) {
-  const left = `${ANSI.white}${subtotal.label}${ANSI.reset} ${ANSI.dim}(${subtotal.count})${ANSI.reset}`;
-  const right = [
-    `NAV ${ANSI.white}${formatCurrency(subtotal.sumNav)}${ANSI.reset}`,
-    `APORTE ${ANSI.white}${formatCurrency(subtotal.sumDeposited)}${ANSI.reset}`,
-    `P/L ${colorizeProfit(subtotal.sumProfit, formatCurrency(subtotal.sumProfit))}`,
-    `RET ${colorizeProfit(subtotal.sumProfit, formatPercent(subtotal.profitRatioRaw))}`,
-  ].join(` ${ANSI.dim}|${ANSI.reset} `);
-
-  return `${left}  ${ANSI.dim}|${ANSI.reset}  ${right}`;
-}
-
-function renderGoals(goals) {
-  const headers = [
-    { key: "goal", label: "GOAL", align: "left" },
-    { key: "type", label: "TYPE", align: "left" },
-    { key: "nav", label: "NAV", align: "right" },
-    { key: "deposited", label: "APORTE", align: "right" },
-    { key: "profit", label: "P/L", align: "right" },
-    { key: "profit_ratio", label: "RET", align: "right" },
-  ];
-
-  const widths = headers.map(({ key, label }) =>
-    goals.reduce((max, goal) => Math.max(max, String(goal[key]).length), label.length)
-  );
-
-  const headerLine = headers
-    .map((header, index) => `${ANSI.dim}${pad(header.label, widths[index], header.align)}${ANSI.reset}`)
-    .join("  ");
-
-  const rows = goals.map((goal) =>
-    headers
-      .map((header, index) => {
-        const rawValue = String(goal[header.key]);
-        const aligned = pad(rawValue, widths[index], header.align);
-
-        if (header.key === "profit" || header.key === "profit_ratio") {
-          return colorizeProfit(goal.profitRaw, aligned);
-        }
-
-        return header.key === "goal" ? `${ANSI.white}${aligned}${ANSI.reset}` : aligned;
-      })
-      .join("  ")
-  );
-
-  return [headerLine, ...rows].join("\n");
+function warnUnmatchedGroups(goals, customGoalGroups) {
+  for (const warning of core.findUnmatchedGroupRefs(goals, customGoalGroups)) {
+    const parts = [];
+    if (warning.unmatchedNames.length) {
+      parts.push(`nombres: ${warning.unmatchedNames.map((n) => `"${n}"`).join(", ")}`);
+    }
+    if (warning.unmatchedIds.length) {
+      parts.push(`ids: ${warning.unmatchedIds.map((id) => `#${id}`).join(", ")}`);
+    }
+    console.warn(
+      paint(ANSI.yellow, "Aviso:") + ` grupo "${warning.label}" sin match — ${parts.join("; ")}`
+    );
+  }
 }
 
 function loadCookie() {
@@ -211,66 +267,117 @@ function loadCookie() {
 function saveCookie(setCookieHeaders) {
   const cookie = setCookieHeaders.map((c) => c.split(";")[0]).join("; ");
   const expiresMatch = setCookieHeaders.join("; ").match(/expires=([^;]+)/i);
-  const expires = expiresMatch ? new Date(expiresMatch[1]).toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  fs.writeFileSync(COOKIE_FILE, JSON.stringify({ cookie, expires }));
+  const expires = expiresMatch
+    ? new Date(expiresMatch[1]).toISOString()
+    : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(COOKIE_FILE, JSON.stringify({ cookie, expires }), { mode: 0o600 });
   return cookie;
 }
 
-async function login() {
-  if (!email || !password) {
-    throw new Error("Faltan USER_EMAIL o USER_PASSWORD para iniciar sesión interactiva");
+async function login({ structured = false } = {}) {
+  if (structured) {
+    throw new Error(
+      "Login interactivo no disponible con --json/--csv. Usa USER_TOKEN o una cookie válida en .cookie."
+    );
   }
 
-  await axios.post("https://fintual.cl/auth/sessions/initiate_login", { email, password });
-  console.log("\x1b[36mSe envió un código de verificación a tu email.\x1b[0m");
+  if (!email || !password) {
+    throw new Error(
+      "Faltan USER_EMAIL o USER_PASSWORD para iniciar sesión interactiva. Usa USER_TOKEN o una cookie válida en .cookie."
+    );
+  }
+
+  try {
+    await axios.post(
+      "https://fintual.cl/auth/sessions/initiate_login",
+      { email, password },
+      { timeout: 15000 }
+    );
+  } catch (err) {
+    throw new Error(core.httpErrorMessage(err, "No se pudo iniciar el login"));
+  }
+
+  authStatus(paint(ANSI.cyan, "Se envió un código de verificación a tu email."));
   const code = await askCode();
 
-  const res = await axios.post(
-    "https://fintual.cl/auth/sessions/finalize_login_web",
-    { email, password, code },
-    { withCredentials: true }
-  );
+  if (!code) {
+    throw new Error("Código vacío. Cancela con Ctrl+C o reintenta con un código válido.");
+  }
+
+  let res;
+  try {
+    res = await axios.post(
+      "https://fintual.cl/auth/sessions/finalize_login_web",
+      { email, password, code },
+      { withCredentials: true, timeout: 15000 }
+    );
+  } catch (err) {
+    throw new Error(core.httpErrorMessage(err, "No se pudo completar el login"));
+  }
 
   const setCookie = res.headers["set-cookie"];
-  if (!setCookie) throw new Error("No se recibió cookie de sesión");
+  if (!setCookie) throw new Error("No se recibió cookie de sesión tras el login");
   return saveCookie(setCookie);
 }
 
-async function getCookie() {
+async function getCookie({ structured = false } = {}) {
   const saved = loadCookie();
   if (saved) return saved;
-  return login();
+  return login({ structured });
 }
 
 async function fetchGoalsWithCookie(cookie) {
-  const res = await axios.get("https://fintual.cl/api/goals", {
-    headers: { Cookie: cookie },
-  });
-  return res.data.data;
+  try {
+    const res = await axios.get("https://fintual.cl/api/goals", {
+      headers: { Cookie: cookie },
+      timeout: 15000,
+    });
+    return res.data.data;
+  } catch (err) {
+    if (err.response?.status === 401) throw err;
+    throw new Error(core.httpErrorMessage(err, "Error al leer goals con cookie"));
+  }
 }
 
 async function fetchGoalsWithToken() {
-  const res = await axios.get("https://fintual.cl/api/goals", {
-    params: {
-      user_email: email,
-      user_token: token,
-    },
-  });
-  return res.data.data;
+  try {
+    const res = await axios.get("https://fintual.cl/api/goals", {
+      params: {
+        user_email: email,
+        user_token: token,
+      },
+      timeout: 15000,
+    });
+    return res.data.data;
+  } catch (err) {
+    // Propagate 401 so callers can fall back to cookie / interactive login.
+    if (err.response?.status === 401) throw err;
+    throw new Error(core.httpErrorMessage(err, "Error al leer goals con token"));
+  }
 }
 
-async function fetchGoals() {
+async function fetchGoals(options = {}) {
+  const structured = Boolean(options.json || options.csv);
+  validateCredentials();
+
   if (email && token) {
     try {
       return await fetchGoalsWithToken();
     } catch (err) {
-      if (!password || err.response?.status !== 401) {
+      if (err.response?.status !== 401) {
         throw err;
       }
+
+      const canFallback = Boolean(password || loadCookie());
+      if (!canFallback) {
+        throw new Error(core.httpErrorMessage(err, "Error al leer goals con token"));
+      }
+
+      authStatus(paint(ANSI.yellow, "Aviso:") + " token rechazado (401). Intentando sesión web...");
     }
   }
 
-  const cookie = await getCookie();
+  const cookie = await getCookie({ structured });
 
   try {
     return await fetchGoalsWithCookie(cookie);
@@ -279,69 +386,383 @@ async function fetchGoals() {
       throw err;
     }
 
-    console.log("\x1b[33mSesión expirada. Iniciando login...\x1b[0m");
-    const refreshedCookie = await login();
+    authStatus(paint(ANSI.yellow, "Sesión expirada. Iniciando login..."));
+    const refreshedCookie = await login({ structured });
     return fetchGoalsWithCookie(refreshedCookie);
   }
 }
 
-async function main() {
-  const data = await fetchGoals();
+function renderSummary(balance) {
+  const summary = [
+    `NAV ${paint(ANSI.white, core.formatCurrency(balance.sumNav))}`,
+    `APORTE ${paint(ANSI.white, core.formatCurrency(balance.sumDeposited))}`,
+    `P/L ${colorizeProfit(balance.sumProfit, core.formatCurrency(balance.sumProfit))}`,
+    `RET ${colorizeProfit(balance.profitRatioRaw, core.formatPercent(balance.profitRatioRaw))}`,
+  ];
 
-  const goals = data.map((d) => {
-    const { name, goal_type, nav, profit, deposited } = d.attributes;
-    const ratio = deposited ? (profit / deposited) * 100 : NaN;
-    return {
-      goal: name,
-      type: goal_type,
-      nav: formatCurrency(nav),
-      deposited: formatCurrency(deposited),
-      profit: formatCurrency(profit),
-      profit_ratio: formatPercent(ratio),
-      navRaw: nav,
-      profitRaw: profit,
-      depositedRaw: deposited,
-      profitRatioRaw: ratio,
-    };
-  });
+  return summary.join(` ${paint(ANSI.dim, "|")} `);
+}
 
-  let sumNav = 0;
-  let sumProfit = 0;
-  let sumDeposited = 0;
-
-  for (let i = 0; i < goals.length; i++) {
-    sumNav += goals[i].navRaw;
-    sumProfit += goals[i].profitRaw;
-    sumDeposited += goals[i].depositedRaw;
+function renderDeltaLine(label, delta) {
+  if (!delta) {
+    return `${paint(ANSI.dim, label)} ${paint(ANSI.dim, "— (sin snapshot base)")}`;
   }
 
-  const balance = {
-    sumNav,
-    sumDeposited,
-    sumProfit,
-    profitRatioRaw: sumDeposited ? (sumProfit / sumDeposited) * 100 : NaN,
-  };
-  const subtotals = buildSubtotals(goals);
+  const parts = [
+    `NAV ${colorizeProfit(delta.nav, core.formatSignedCurrency(delta.nav))}`,
+    `P/L ${colorizeProfit(delta.profit, core.formatSignedCurrency(delta.profit))}`,
+  ];
 
-  const title = `${ANSI.cyan}FINTUAL${ANSI.reset} ${ANSI.dim}TERMINAL${ANSI.reset}`;
-  const subtitle = `${ANSI.dim}${email}${ANSI.reset}`;
-  const updatedAt = `${ANSI.dim}${new Date().toLocaleString("es-CL")}${ANSI.reset}`;
+  return `${paint(ANSI.dim, label)} ${parts.join(` ${paint(ANSI.dim, "|")} `)} ${paint(ANSI.dim, `(vs ${delta.date})`)}`;
+}
 
-  console.log("");
-  console.log(title);
-  console.log(`${subtitle}  ${ANSI.dim}|${ANSI.reset}  ${updatedAt}`);
-  console.log(renderRule());
-  console.log(renderSummary(balance));
-  if (subtotals.length > 0) {
-    console.log(renderRule());
-    for (const subtotal of subtotals) {
-      console.log(renderSubtotal(subtotal));
+function renderSubtotal(subtotal, totalNav) {
+  const weight = totalNav ? (subtotal.sumNav / totalNav) * 100 : NaN;
+  const left = `${paint(ANSI.white, subtotal.label)} ${paint(ANSI.dim, `(${subtotal.count})`)} ${paint(ANSI.dim, core.formatWeight(weight))}`;
+  const right = [
+    `NAV ${paint(ANSI.white, core.formatCurrency(subtotal.sumNav))}`,
+    `APORTE ${paint(ANSI.white, core.formatCurrency(subtotal.sumDeposited))}`,
+    `P/L ${colorizeProfit(subtotal.sumProfit, core.formatCurrency(subtotal.sumProfit))}`,
+    `RET ${colorizeProfit(subtotal.sumProfit, core.formatPercent(subtotal.profitRatioRaw))}`,
+  ].join(` ${paint(ANSI.dim, "|")} `);
+
+  return `${left}  ${paint(ANSI.dim, "|")}  ${right}`;
+}
+
+function goalTableHeaders(options) {
+  const headers = [
+    { key: "goal", label: "GOAL", align: "left" },
+    { key: "type", label: "TYPE", align: "left" },
+    { key: "nav", label: "NAV", align: "right" },
+    { key: "weight", label: "%", align: "right" },
+    { key: "deposited", label: "APORTE", align: "right" },
+    { key: "profit", label: "P/L", align: "right" },
+    { key: "profit_ratio", label: "RET", align: "right" },
+  ];
+
+  if (!options.noDiff) {
+    headers.push({ key: "d1Nav", label: "Δ1D", align: "right" });
+  }
+
+  return headers;
+}
+
+function computeWidths(headers, goals) {
+  return headers.map(({ key, label }) =>
+    goals.reduce((max, goal) => Math.max(max, String(goal[key] ?? "").length), label.length)
+  );
+}
+
+function renderGoalRow(goal, headers, widths) {
+  return headers
+    .map((header, index) => {
+      const rawValue = String(goal[header.key] ?? "");
+      const aligned = core.pad(rawValue, widths[index], header.align);
+
+      if (header.key === "profit" || header.key === "profit_ratio") {
+        return colorizeProfit(goal.profitRaw, aligned);
+      }
+      if (header.key === "d1Nav") {
+        if (goal.d1NavRaw == null) return paint(ANSI.dim, aligned);
+        return colorizeProfit(goal.d1NavRaw, aligned);
+      }
+      if (header.key === "weight") {
+        return paint(ANSI.dim, aligned);
+      }
+
+      return header.key === "goal" ? paint(ANSI.white, aligned) : aligned;
+    })
+    .join("  ");
+}
+
+function renderGoalsTable(goals, options) {
+  if (goals.length === 0) {
+    return paint(ANSI.dim, "(sin objetivos que coincidan con los filtros)");
+  }
+
+  const headers = goalTableHeaders(options);
+  const widths = computeWidths(headers, goals);
+  const headerLine = headers
+    .map((header, index) => paint(ANSI.dim, core.pad(header.label, widths[index], header.align)))
+    .join("  ");
+
+  const rows = goals.map((goal) => renderGoalRow(goal, headers, widths));
+  return [headerLine, ...rows].join("\n");
+}
+
+function renderGroupedGoals(goals, customGoalGroups, options) {
+  const sections = core.buildGroupedSections(goals, customGoalGroups, options);
+  if (sections.length === 0) {
+    return paint(ANSI.dim, "(sin objetivos que coincidan con los filtros)");
+  }
+
+  const headers = goalTableHeaders(options);
+  const widths = computeWidths(headers, goals);
+  const headerLine = headers
+    .map((header, index) => paint(ANSI.dim, core.pad(header.label, widths[index], header.align)))
+    .join("  ");
+
+  const lines = [headerLine];
+
+  for (const section of sections) {
+    const weight = goals.length
+      ? core.formatWeight((section.sumNav / core.summarizeGoals(goals).sumNav) * 100)
+      : "—";
+    lines.push(
+      paint(
+        ANSI.cyan,
+        `▸ ${section.label} (${section.count}) ${weight}  NAV ${core.formatCurrency(section.sumNav)}`
+      )
+    );
+    for (const goal of section.goals) {
+      lines.push(renderGoalRow(goal, headers, widths));
     }
   }
-  console.log(renderRule());
-  console.log(renderGoals(goals));
-  console.log(renderRule());
+
+  return lines.join("\n");
+}
+
+function renderHistory() {
+  const snapshots = listSnapshotMeta();
+  const today = core.localDateKey();
+
+  console.log("");
+  console.log(`${paint(ANSI.cyan, "FINTUAL")} ${paint(ANSI.dim, "SNAPSHOTS")}`);
+  console.log(paint(ANSI.dim, path.relative(process.cwd(), SNAPSHOTS_DIR) || ".snapshots"));
+  console.log(renderRule(72));
+
+  if (snapshots.length === 0) {
+    console.log(paint(ANSI.dim, "(sin snapshots aún — ejecuta el CLI una vez para crear el de hoy)"));
+    console.log(renderRule(72));
+    console.log("");
+    return;
+  }
+
+  for (const snap of snapshots) {
+    const tag = snap.date === today ? paint(ANSI.cyan, "hoy") : paint(ANSI.dim, snap.date);
+    const nav = snap.nav == null ? "—" : core.formatCurrency(snap.nav);
+    const pl = snap.profit == null ? "—" : core.formatCurrency(snap.profit);
+    const line = [
+      paint(ANSI.white, snap.date),
+      tag,
+      `NAV ${nav}`,
+      `P/L ${pl}`,
+      paint(ANSI.dim, `${snap.goalCount} goals`),
+    ].join(`  ${paint(ANSI.dim, "|")}  `);
+    console.log(line);
+  }
+
+  console.log(renderRule(72));
+  console.log(paint(ANSI.dim, `${snapshots.length} snapshot(s)`));
   console.log("");
 }
 
-main().catch((error) => console.log("\x1b[31mError:\x1b[0m", error.message));
+function renderJson({ goals, balance, subtotals, options, deltas, snapshotInfo, customGoalGroups }) {
+  const payload = {
+    email,
+    generatedAt: new Date().toISOString(),
+    filters: {
+      type: options.type,
+      group: options.group,
+      sort: options.sort,
+      grouped: options.grouped,
+    },
+    summary: {
+      nav: balance.sumNav,
+      deposited: balance.sumDeposited,
+      profit: balance.sumProfit,
+      returnPct: Number.isFinite(balance.profitRatioRaw) ? balance.profitRatioRaw : null,
+    },
+    deltas: options.noDiff
+      ? null
+      : {
+          day: deltas.day,
+          month: deltas.month,
+        },
+    snapshot: snapshotInfo,
+    subtotals: subtotals.map((s) => ({
+      label: s.label,
+      count: s.count,
+      nav: s.sumNav,
+      deposited: s.sumDeposited,
+      profit: s.sumProfit,
+      returnPct: Number.isFinite(s.profitRatioRaw) ? s.profitRatioRaw : null,
+      weightPct: balance.sumNav ? (s.sumNav / balance.sumNav) * 100 : null,
+    })),
+    goals: goals.map((g) => ({
+      id: g.id,
+      name: g.goal,
+      type: g.type,
+      group: core.assignPrimaryGroupLabel(g, customGoalGroups),
+      nav: g.navRaw,
+      deposited: g.depositedRaw,
+      profit: g.profitRaw,
+      returnPct: Number.isFinite(g.profitRatioRaw) ? g.profitRatioRaw : null,
+      weightPct: Number.isFinite(g.weightRaw) ? g.weightRaw : null,
+      delta1d: options.noDiff
+        ? null
+        : {
+            nav: g.d1NavRaw,
+            profit: g.d1ProfitRaw,
+          },
+      delta1m: options.noDiff
+        ? null
+        : {
+            nav: g.m1NavRaw,
+            profit: g.m1ProfitRaw,
+          },
+    })),
+  };
+
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+function renderTerminal({
+  goals,
+  balance,
+  subtotals,
+  options,
+  deltas,
+  snapshotInfo,
+  customGoalGroups,
+}) {
+  const title = `${paint(ANSI.cyan, "FINTUAL")} ${paint(ANSI.dim, "TERMINAL")}`;
+  const subtitle = paint(ANSI.dim, email || "");
+  const updatedAt = paint(ANSI.dim, new Date().toLocaleString("es-CL"));
+
+  console.log("");
+  console.log(title);
+  console.log(`${subtitle}  ${paint(ANSI.dim, "|")}  ${updatedAt}`);
+  console.log(renderRule());
+  console.log(renderSummary(balance));
+
+  if (!options.noDiff) {
+    console.log(renderDeltaLine("Δ1D", deltas.day));
+    console.log(renderDeltaLine("Δ1M", deltas.month));
+  }
+
+  if (subtotals.length > 0 && !options.grouped) {
+    console.log(renderRule());
+    for (const subtotal of subtotals) {
+      console.log(renderSubtotal(subtotal, balance.sumNav));
+    }
+  }
+
+  console.log(renderRule());
+  if (options.grouped) {
+    console.log(renderGroupedGoals(goals, customGoalGroups, options));
+  } else {
+    console.log(renderGoalsTable(goals, options));
+  }
+  console.log(renderRule());
+
+  if (snapshotInfo.saved) {
+    let msg = `snapshot ${snapshotInfo.date} guardado`;
+    if (snapshotInfo.pruned?.length) {
+      msg += ` · podados ${snapshotInfo.pruned.length}`;
+    }
+    console.log(paint(ANSI.dim, msg));
+  } else if (snapshotInfo.skipped) {
+    console.log(paint(ANSI.dim, "snapshot omitido (--no-snapshot)"));
+  }
+
+  if (!options.noDiff && !deltas.day) {
+    console.log(paint(ANSI.dim, "Δ1D disponible a partir del próximo día con un snapshot previo"));
+  }
+
+  console.log("");
+}
+
+async function main() {
+  const options = core.parseArgs(process.argv.slice(2));
+  options.keepSnapshots = resolveKeepSnapshots(options);
+
+  if (options.help) {
+    printHelp();
+    return;
+  }
+
+  if (options.noColor || options.json || options.csv || process.env.NO_COLOR != null) {
+    useColor = false;
+  }
+
+  if (options.history) {
+    renderHistory();
+    return;
+  }
+
+  const customGoalGroups = loadGoalGroups();
+  const data = await fetchGoals(options);
+  const allGoals = core.mapGoals(data);
+
+  warnUnmatchedGroups(allGoals, customGoalGroups);
+
+  const fullBalance = core.summarizeGoals(allGoals);
+  const todayKey = core.localDateKey();
+  const existingSnapshots = listSnapshotMeta();
+  const dayBaseline = core.findDayBaseline(todayKey, existingSnapshots);
+  const monthBaseline = core.findMonthBaseline(todayKey, existingSnapshots);
+
+  const snapshotInfo = {
+    date: todayKey,
+    saved: false,
+    skipped: options.noSnapshot,
+    dayBaseline: dayBaseline?.date ?? null,
+    monthBaseline: monthBaseline?.date ?? null,
+    path: snapshotPath(todayKey),
+    keepDays: options.keepSnapshots,
+    pruned: [],
+  };
+
+  if (!options.noSnapshot) {
+    const snapshot = core.buildSnapshot(allGoals, fullBalance, {
+      email: email || null,
+      dateKey: todayKey,
+    });
+    saveSnapshot(snapshot);
+    snapshotInfo.saved = true;
+    snapshotInfo.pruned = pruneSnapshots(todayKey, options.keepSnapshots);
+  }
+
+  const filtered = core.filterGoals(allGoals, customGoalGroups, options);
+  const balance = core.summarizeGoals(filtered);
+  const withMeta = core.attachWeightsAndDeltas(
+    filtered,
+    balance.sumNav,
+    dayBaseline,
+    monthBaseline,
+    options
+  );
+  const goals = core.sortGoals(withMeta, options.sort);
+  const subtotals = core.buildSubtotals(goals, customGoalGroups, options);
+
+  let deltas = core.computeSummaryDeltas(balance, dayBaseline, monthBaseline);
+  if ((options.type || options.group) && !options.noDiff) {
+    deltas = core.recomputeFilteredDeltas(goals, balance, dayBaseline, monthBaseline);
+  }
+
+  if (options.json) {
+    renderJson({ goals, balance, subtotals, options, deltas, snapshotInfo, customGoalGroups });
+  } else if (options.csv) {
+    process.stdout.write(core.renderCsv(goals, customGoalGroups, options));
+  } else {
+    renderTerminal({
+      goals,
+      balance,
+      subtotals,
+      options,
+      deltas,
+      snapshotInfo,
+      customGoalGroups,
+    });
+  }
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(paint(ANSI.red, "Error:"), error.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { main, loadGoalGroups, listSnapshotMeta, pruneSnapshots };
