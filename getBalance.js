@@ -101,7 +101,8 @@ Grupos (.goal-groups.json):
 
 Autenticación (en orden):
   1. USER_EMAIL + USER_TOKEN
-  2. Cookie local válida en .cookie (no requiere USER_EMAIL)
+  2. Sesión local en .cookie (access token de ~5 min; se renueva solo
+     con el refresh token vía POST /auth/jwt, sin pedir código)
   3. Login interactivo con USER_EMAIL + USER_PASSWORD (solo terminal; no con --json/--csv)
 
 Variables de entorno:
@@ -131,8 +132,10 @@ function authStatus(message) {
 
 function validateCredentials() {
   // Cookie-only: API call uses Cookie header; email is optional for display/snapshots.
-  if (loadCookie()) {
-    return;
+  const jar = loadCookieJar();
+  if (jar) {
+    const status = core.cookieJarStatus(jar);
+    if (status.hasFreshAccess || status.hasRefresh) return;
   }
 
   if (token) {
@@ -256,22 +259,28 @@ function warnUnmatchedGroups(goals, customGoalGroups) {
   }
 }
 
-function loadCookie() {
+function loadCookieJar() {
   try {
     const data = JSON.parse(fs.readFileSync(COOKIE_FILE, "utf-8"));
-    if (new Date(data.expires) > new Date()) return data.cookie;
+    return core.upgradeCookieJar(data);
   } catch {}
   return null;
 }
 
-function saveCookie(setCookieHeaders) {
-  const cookie = setCookieHeaders.map((c) => c.split(";")[0]).join("; ");
-  const expiresMatch = setCookieHeaders.join("; ").match(/expires=([^;]+)/i);
-  const expires = expiresMatch
-    ? new Date(expiresMatch[1]).toISOString()
-    : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  fs.writeFileSync(COOKIE_FILE, JSON.stringify({ cookie, expires }), { mode: 0o600 });
-  return cookie;
+function saveCookieJar(jar) {
+  fs.writeFileSync(COOKIE_FILE, `${JSON.stringify(jar, null, 2)}\n`, { mode: 0o600 });
+  // mode solo aplica al crear; asegura 0600 también cuando el archivo ya existía.
+  fs.chmodSync(COOKIE_FILE, 0o600);
+}
+
+// Persiste las cookies rotadas que llegan en cualquier respuesta (el refresh
+// entrega un monolith_token nuevo; el refresh token también puede rotar).
+function absorbSetCookies(jar, res) {
+  const parsed = core.parseSetCookies(res.headers?.["set-cookie"]);
+  if (!parsed.length) return jar;
+  const merged = core.mergeCookieJar(jar, parsed);
+  saveCookieJar(merged);
+  return merged;
 }
 
 async function login({ structured = false } = {}) {
@@ -317,21 +326,63 @@ async function login({ structured = false } = {}) {
 
   const setCookie = res.headers["set-cookie"];
   if (!setCookie) throw new Error("No se recibió cookie de sesión tras el login");
-  return saveCookie(setCookie);
+  const jar = core.mergeCookieJar(null, core.parseSetCookies(setCookie));
+  saveCookieJar(jar);
+  return jar;
 }
 
-async function getCookie({ structured = false } = {}) {
-  const saved = loadCookie();
-  if (saved) return saved;
+/**
+ * Renueva el access token (monolith_token, ~5 min) usando el refresh token,
+ * igual que la web de Fintual: POST /auth/jwt con las cookies de sesión.
+ * Devuelve el jar actualizado, o null si el refresh token fue rechazado
+ * (ahí corresponde login completo).
+ */
+async function refreshSession(jar) {
+  let res;
+  try {
+    res = await axios.post(
+      "https://fintual.cl/auth/jwt",
+      { aud: "" },
+      {
+        headers: {
+          Cookie: core.cookieHeaderFromJar(jar),
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: 15000,
+      }
+    );
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 401 || status === 403) return null;
+    throw new Error(core.httpErrorMessage(err, "No se pudo refrescar la sesión"));
+  }
+
+  const updated = absorbSetCookies(jar, res);
+  return core.cookieJarStatus(updated).hasFreshAccess ? updated : null;
+}
+
+async function getSessionJar({ structured = false } = {}) {
+  const jar = loadCookieJar();
+  if (jar) {
+    const status = core.cookieJarStatus(jar);
+    if (status.hasFreshAccess) return jar;
+    if (status.hasRefresh) {
+      const refreshed = await refreshSession(jar);
+      if (refreshed) return refreshed;
+      authStatus(paint(ANSI.yellow, "Aviso:") + " refresh token rechazado. Se requiere login.");
+    }
+  }
   return login({ structured });
 }
 
-async function fetchGoalsWithCookie(cookie) {
+async function fetchGoalsWithJar(jar) {
   try {
     const res = await axios.get("https://fintual.cl/api/goals", {
-      headers: { Cookie: cookie },
+      headers: { Cookie: core.cookieHeaderFromJar(jar) },
       timeout: 15000,
     });
+    absorbSetCookies(jar, res);
     return res.data.data;
   } catch (err) {
     if (err.response?.status === 401) throw err;
@@ -368,7 +419,11 @@ async function fetchGoals(options = {}) {
         throw err;
       }
 
-      const canFallback = Boolean(password || loadCookie());
+      const savedJar = loadCookieJar();
+      const savedStatus = savedJar ? core.cookieJarStatus(savedJar) : null;
+      const canFallback = Boolean(
+        password || (savedStatus && (savedStatus.hasFreshAccess || savedStatus.hasRefresh))
+      );
       if (!canFallback) {
         throw new Error(core.httpErrorMessage(err, "Error al leer goals con token"));
       }
@@ -377,18 +432,28 @@ async function fetchGoals(options = {}) {
     }
   }
 
-  const cookie = await getCookie({ structured });
+  let jar = await getSessionJar({ structured });
 
   try {
-    return await fetchGoalsWithCookie(cookie);
+    return await fetchGoalsWithJar(jar);
   } catch (err) {
     if (err.response?.status !== 401) {
       throw err;
     }
 
+    // Access token rechazado pese a verse vigente: un refresh puede salvarlo.
+    const refreshed = await refreshSession(jar);
+    if (refreshed) {
+      try {
+        return await fetchGoalsWithJar(refreshed);
+      } catch (retryErr) {
+        if (retryErr.response?.status !== 401) throw retryErr;
+      }
+    }
+
     authStatus(paint(ANSI.yellow, "Sesión expirada. Iniciando login..."));
-    const refreshedCookie = await login({ structured });
-    return fetchGoalsWithCookie(refreshedCookie);
+    jar = await login({ structured });
+    return fetchGoalsWithJar(jar);
   }
 }
 

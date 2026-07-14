@@ -226,3 +226,124 @@ describe("format helpers", () => {
     assert.equal(core.normalizeGoalName("💰 Sabatini M"), "sabatini m");
   });
 });
+
+describe("cookie jar", () => {
+  const NOW = new Date("2026-07-13T20:00:00.000Z");
+
+  function fakeJwt(expSeconds) {
+    const b64url = (obj) =>
+      Buffer.from(JSON.stringify(obj)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return `${b64url({ alg: "none" })}.${b64url({ exp: expSeconds })}.sig`;
+  }
+
+  it("parses Set-Cookie headers with expires and max-age", () => {
+    const parsed = core.parseSetCookies(
+      [
+        "monolith_token=abc; path=/; expires=Mon, 13 Jul 2026 20:05:00 GMT; secure; HttpOnly",
+        "auth_refresh_token=xyz; path=/; max-age=1209600; HttpOnly",
+        "email=nico%40mail.com; path=/",
+        "malformed",
+      ],
+      NOW
+    );
+
+    assert.equal(parsed.length, 3);
+    assert.deepEqual(parsed[0], {
+      name: "monolith_token",
+      value: "abc",
+      expires: "2026-07-13T20:05:00.000Z",
+    });
+    assert.equal(parsed[1].expires, new Date(NOW.getTime() + 1209600 * 1000).toISOString());
+    assert.equal(parsed[2].expires, null);
+  });
+
+  it("max-age takes precedence over expires", () => {
+    const [cookie] = core.parseSetCookies(
+      ["a=1; expires=Mon, 13 Jul 2026 20:05:00 GMT; max-age=60"],
+      NOW
+    );
+    assert.equal(cookie.expires, new Date(NOW.getTime() + 60 * 1000).toISOString());
+  });
+
+  it("merges cookies into a jar, deleting expired/empty ones", () => {
+    let jar = core.mergeCookieJar(null, core.parseSetCookies(["a=1; max-age=100", "b=2"], NOW), NOW);
+    assert.equal(jar.version, core.COOKIE_JAR_VERSION);
+    assert.equal(jar.cookies.a.value, "1");
+    assert.equal(jar.cookies.b.expires, null);
+
+    jar = core.mergeCookieJar(
+      jar,
+      core.parseSetCookies(["a=9; max-age=100", "b=; expires=Thu, 01 Jan 1970 00:00:00 GMT"], NOW),
+      NOW
+    );
+    assert.equal(jar.cookies.a.value, "9");
+    assert.equal(jar.cookies.b, undefined);
+  });
+
+  it("falls back to the JWT exp claim when the cookie has no expiry", () => {
+    const exp = Math.floor(NOW.getTime() / 1000) + 300;
+    const jar = core.mergeCookieJar(
+      null,
+      core.parseSetCookies([`monolith_token=${fakeJwt(exp)}; path=/; HttpOnly`], NOW),
+      NOW
+    );
+    assert.equal(jar.cookies.monolith_token.expires, new Date(exp * 1000).toISOString());
+  });
+
+  it("upgrades legacy v1 .cookie payloads", () => {
+    const legacy = {
+      cookie: "monolith_token=abc; auth_refresh_token=xyz; email=nico",
+      expires: "2026-07-13T20:05:00.000Z",
+    };
+    const jar = core.upgradeCookieJar(legacy);
+    assert.equal(jar.version, core.COOKIE_JAR_VERSION);
+    assert.equal(jar.cookies.monolith_token.expires, "2026-07-13T20:05:00.000Z");
+    assert.equal(jar.cookies.auth_refresh_token.value, "xyz");
+    assert.equal(jar.cookies.auth_refresh_token.expires, null);
+
+    assert.equal(core.upgradeCookieJar(null), null);
+    assert.equal(core.upgradeCookieJar({}), null);
+    const v2 = { version: core.COOKIE_JAR_VERSION, cookies: {} };
+    assert.equal(core.upgradeCookieJar(v2), v2);
+  });
+
+  it("builds a Cookie header excluding expired cookies", () => {
+    const jar = {
+      version: core.COOKIE_JAR_VERSION,
+      cookies: {
+        monolith_token: { value: "old", expires: "2026-07-13T19:00:00.000Z" },
+        auth_refresh_token: { value: "xyz", expires: null },
+        email: { value: "nico", expires: "2026-08-01T00:00:00.000Z" },
+      },
+    };
+    assert.equal(core.cookieHeaderFromJar(jar, NOW), "auth_refresh_token=xyz; email=nico");
+    assert.equal(core.cookieHeaderFromJar(null, NOW), "");
+  });
+
+  it("reports jar status with skew margin on the access token", () => {
+    const soon = new Date(NOW.getTime() + 10 * 1000).toISOString(); // dentro del margen de 30s
+    const later = new Date(NOW.getTime() + 5 * 60 * 1000).toISOString();
+
+    let status = core.cookieJarStatus(
+      { version: 2, cookies: { monolith_token: { value: "a", expires: later } } },
+      NOW
+    );
+    assert.equal(status.hasFreshAccess, true);
+    assert.equal(status.hasRefresh, false);
+
+    status = core.cookieJarStatus(
+      {
+        version: 2,
+        cookies: {
+          monolith_token: { value: "a", expires: soon },
+          auth_refresh_token: { value: "r", expires: null },
+        },
+      },
+      NOW
+    );
+    assert.equal(status.hasFreshAccess, false);
+    assert.equal(status.hasRefresh, true);
+
+    assert.deepEqual(core.cookieJarStatus(null, NOW), { hasFreshAccess: false, hasRefresh: false });
+  });
+});
