@@ -354,7 +354,7 @@ async function refreshSession(jar) {
     );
   } catch (err) {
     const status = err.response?.status;
-    if (status === 401 || status === 403) return null;
+    if (core.isSessionRefreshRejection(status)) return null;
     throw new Error(core.httpErrorMessage(err, "No se pudo refrescar la sesión"));
   }
 

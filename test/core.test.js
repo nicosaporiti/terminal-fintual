@@ -346,4 +346,14 @@ describe("cookie jar", () => {
 
     assert.deepEqual(core.cookieJarStatus(null, NOW), { hasFreshAccess: false, hasRefresh: false });
   });
+
+  it("recognizes refresh responses that require a new login", () => {
+    for (const status of [400, 401, 403, 422]) {
+      assert.equal(core.isSessionRefreshRejection(status), true);
+    }
+
+    for (const status of [404, 429, 500, undefined]) {
+      assert.equal(core.isSessionRefreshRejection(status), false);
+    }
+  });
 });
